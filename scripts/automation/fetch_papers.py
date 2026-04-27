@@ -11,7 +11,11 @@ import json
 import time
 import logging
 import warnings
+import argparse
 import arxiv
+import urllib.request
+import urllib.parse
+import urllib.error
 from datetime import datetime, timedelta
 from pathlib import Path
 from serpapi import GoogleSearch
@@ -379,6 +383,150 @@ def search_google_scholar(keywords, config, api_key, max_results=5, days_back=7)
 
     return all_papers
 
+def load_seen_semantic_scholar_papers(config):
+    """Load previously seen Semantic Scholar papers from tracking file"""
+    research_root = Path(config['paths']['research_root']).expanduser().resolve()
+    data_dir = research_root / config['paths']['data']
+    tracking_file = data_dir / ".seen_semantic_scholar_papers.json"
+
+    if tracking_file.exists():
+        with open(tracking_file, 'r') as f:
+            data = json.load(f)
+            return set(data.get('urls', []))
+    return set()
+
+def save_seen_semantic_scholar_papers(config, seen_urls):
+    """Save seen Semantic Scholar papers to tracking file"""
+    research_root = Path(config['paths']['research_root']).expanduser().resolve()
+    data_dir = research_root / config['paths']['data']
+    tracking_file = data_dir / ".seen_semantic_scholar_papers.json"
+
+    with open(tracking_file, 'w') as f:
+        json.dump({
+            'urls': list(seen_urls),
+            'last_updated': datetime.now().isoformat()
+        }, f, indent=2)
+
+def search_semantic_scholar(keywords, config, max_results=10, days_back=1, api_key=None):
+    """Search Semantic Scholar for papers matching keywords.
+
+    Uses the Academic Graph API. Free API key available at:
+    https://www.semanticscholar.org/product/api#api-key-form
+
+    Args:
+        keywords: List of search keywords
+        config: Configuration dict
+        max_results: Max results per keyword (max 100 per API call)
+        days_back: Only include papers from last N days
+        api_key: Optional API key for authenticated rate limits (1 RPS)
+
+    Returns:
+        List of paper dicts
+    """
+    all_papers = []
+    seen_urls = set()
+
+    previously_seen = load_seen_semantic_scholar_papers(config)
+
+    # Calculate date range for filtering
+    start_date = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
+    end_date = datetime.now().strftime('%Y-%m-%d')
+    date_range = f"{start_date}:{end_date}"
+
+    base_url = "https://api.semanticscholar.org/graph/v1/paper/search"
+    fields = "paperId,title,authors,abstract,year,url,externalIds,publicationDate,citationCount,openAccessPdf"
+
+    for i, keyword in enumerate(keywords, 1):
+        print(f"  [S2 {i}/{len(keywords)}] Searching: {keyword[:80]}...", flush=True)
+
+        # Rate limit: 1 RPS with API key, more conservative without
+        if i > 1:
+            time.sleep(2 if api_key else 5)
+
+        params = urllib.parse.urlencode({
+            'query': keyword,
+            'limit': min(max_results, 100),
+            'fields': fields,
+            'publicationDateOrYear': date_range,
+        })
+
+        url = f"{base_url}?{params}"
+
+        # Retry logic for 429 rate limiting
+        max_retries = 3
+        retry_delays = [5, 15, 30]
+
+        for attempt in range(max_retries + 1):
+            try:
+                req = urllib.request.Request(url)
+                req.add_header('User-Agent', 'ResearchAutomation/1.0')
+                if api_key:
+                    req.add_header('x-api-key', api_key)
+
+                with urllib.request.urlopen(req, timeout=30) as response:
+                    data = json.loads(response.read().decode())
+
+                papers = data.get('data', [])
+
+                for paper in papers:
+                    paper_url = paper.get('url', '')
+                    if not paper_url:
+                        paper_url = f"https://www.semanticscholar.org/paper/{paper.get('paperId', '')}"
+
+                    if paper_url in seen_urls or paper_url in previously_seen:
+                        continue
+
+                    # Build author string
+                    authors = paper.get('authors', [])
+                    author_str = ', '.join(a.get('name', 'Unknown') for a in authors[:5])
+                    if len(authors) > 5:
+                        author_str += f' et al. ({len(authors)} authors)'
+
+                    paper_dict = {
+                        'title': paper.get('title', 'No title'),
+                        'authors': author_str,
+                        'year': paper.get('year', 'Unknown'),
+                        'abstract': (paper.get('abstract') or '').replace('\n', ' '),
+                        'url': paper_url,
+                        'source': 'Semantic Scholar',
+                        'citations': paper.get('citationCount', 0),
+                    }
+
+                    # Add PDF link if available
+                    open_access = paper.get('openAccessPdf')
+                    if open_access and open_access.get('url'):
+                        paper_dict['pdf_url'] = open_access['url']
+
+                    # Add arXiv link if available
+                    external_ids = paper.get('externalIds', {})
+                    if external_ids and external_ids.get('ArXiv'):
+                        paper_dict['arxiv_id'] = external_ids['ArXiv']
+
+                    all_papers.append(paper_dict)
+                    seen_urls.add(paper_url)
+
+                break  # Success, exit retry loop
+
+            except urllib.error.HTTPError as e:
+                if e.code == 429 and attempt < max_retries:
+                    delay = retry_delays[attempt]
+                    print(f"    429 rate limited, retrying in {delay}s (attempt {attempt + 1}/{max_retries})...", flush=True)
+                    time.sleep(delay)
+                elif e.code == 429:
+                    print(f"    429 rate limited after {max_retries} retries, skipping keyword", flush=True)
+                else:
+                    print(f"    HTTP error {e.code}: {e.reason}", flush=True)
+                    break
+            except Exception as e:
+                print(f"    Error searching Semantic Scholar: {e}", flush=True)
+                break
+
+    # Save all seen URLs
+    all_seen = previously_seen.union(seen_urls)
+    save_seen_semantic_scholar_papers(config, all_seen)
+
+    return all_papers
+
 def generate_digest(topics_papers, output_path, rate_limit_note=None, total_keywords=0):
     """Generate markdown digest from papers grouped by topic.
 
@@ -444,12 +592,21 @@ def generate_digest(topics_papers, output_path, rate_limit_note=None, total_keyw
     return len([p for papers in topics_papers.values() for p in papers])
 
 def main():
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description='Fetch papers from arXiv, Semantic Scholar, and Google Scholar')
+    parser.add_argument('--days-back', type=int, default=None,
+                        help='Override days_back for all sources (e.g., 90 for 3-month backfill)')
+    args = parser.parse_args()
+
     # Load configuration
     config = load_config()
 
     # Setup logging to capture warnings and errors
     logger = setup_logging(config)
     logger.info("Starting fetch_papers.py")
+
+    if args.days_back:
+        logger.info(f"Using --days-back override: {args.days_back} days")
 
     # Load keywords by topic
     research_root = config['paths']['research_root']
@@ -461,7 +618,12 @@ def main():
     total_arxiv_queries = sum(len(keywords) for keywords in topics.values())
 
     # Determine which sources to search
-    is_weekly = datetime.now().weekday() == 6  # Sunday = weekly Google Scholar search
+    # When --days-back is specified, force all sources to run (backfill mode)
+    is_backfill = args.days_back is not None
+    is_weekly = is_backfill or datetime.now().weekday() == 6  # Sunday = weekly Google Scholar search
+
+    if is_backfill:
+        print(f"Backfill mode: searching last {args.days_back} days across all sources", flush=True)
 
     # Fetch papers for each topic
     topics_papers = {}
@@ -472,13 +634,16 @@ def main():
         print(f"\n[{topic_num}/{len(topics)}] Searching for '{topic}' ({len(keywords)} keywords)...", flush=True)
         papers = []
 
+        # Resolve days_back and max_results for each source
+        arxiv_days = args.days_back or config['arxiv'].get('days_back', 1)
+        arxiv_max = config['arxiv']['max_results'] if not is_backfill else max(config['arxiv']['max_results'], 100)
+
         # Always search arXiv (daily)
         try:
-            arxiv_days = config['arxiv'].get('days_back', 1)  # Default to 1 day
             arxiv_papers = search_arxiv(
                 keywords,
                 config,
-                config['arxiv']['max_results'],
+                arxiv_max,
                 arxiv_days,
                 topic_name=topic,
                 global_query_offset=global_query_offset,
@@ -502,15 +667,38 @@ def main():
             print(f"  Error searching arXiv: {e}", flush=True)
             global_query_offset += len(keywords)
 
-        # Search Google Scholar (weekly only)
+        # Always search Semantic Scholar (daily)
+        try:
+            s2_config = config.get('semantic_scholar', {})
+            s2_days = args.days_back or s2_config.get('days_back', 1)
+            s2_max = s2_config.get('max_results', 10) if not is_backfill else max(s2_config.get('max_results', 10), 100)
+
+            s2_api_key = s2_config.get('api_key', '') or None
+
+            s2_papers = search_semantic_scholar(
+                keywords,
+                config,
+                s2_max,
+                s2_days,
+                api_key=s2_api_key
+            )
+            papers.extend(s2_papers)
+            print(f"  Found {len(s2_papers)} papers from Semantic Scholar", flush=True)
+        except Exception as e:
+            print(f"  Error searching Semantic Scholar: {e}", flush=True)
+
+        # Search Google Scholar (weekly or backfill only)
         if is_weekly:
             try:
+                scholar_days = args.days_back or config['google_scholar'].get('search_days', 7)
+                scholar_max = config['google_scholar']['max_results'] if not is_backfill else max(config['google_scholar']['max_results'], 100)
+
                 scholar_papers = search_google_scholar(
                     keywords,
                     config,
                     config['serpapi']['api_key'],
-                    config['google_scholar']['max_results'],
-                    config['google_scholar']['search_days']
+                    scholar_max,
+                    scholar_days
                 )
                 papers.extend(scholar_papers)
                 print(f"  Found {len(scholar_papers)} papers from Google Scholar", flush=True)
