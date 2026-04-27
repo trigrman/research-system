@@ -596,6 +596,10 @@ def main():
     parser = argparse.ArgumentParser(description='Fetch papers from arXiv, Semantic Scholar, and Google Scholar')
     parser.add_argument('--days-back', type=int, default=None,
                         help='Override days_back for all sources (e.g., 90 for 3-month backfill)')
+    parser.add_argument('--query', action='append', default=None,
+                        help='Ad hoc search query; bypasses keywords.md. Repeatable: --query "a" --query "b"')
+    parser.add_argument('--topic-name', type=str, default='ad-hoc',
+                        help='Topic name used for ad hoc --query results in the digest (default: ad-hoc)')
     args = parser.parse_args()
 
     # Load configuration
@@ -608,11 +612,15 @@ def main():
     if args.days_back:
         logger.info(f"Using --days-back override: {args.days_back} days")
 
-    # Load keywords by topic
+    # Load topics: ad hoc --query bypasses keywords.md entirely
     research_root = config['paths']['research_root']
-    topics = load_keywords(research_root)
-
-    print(f"Found {len(topics)} topics with keywords", flush=True)
+    if args.query:
+        topics = {args.topic_name: args.query}
+        logger.info(f"Ad hoc mode: {len(args.query)} queries under topic '{args.topic_name}'")
+        print(f"Ad hoc mode: {len(args.query)} queries under topic '{args.topic_name}'", flush=True)
+    else:
+        topics = load_keywords(research_root)
+        print(f"Found {len(topics)} topics with keywords", flush=True)
 
     # Calculate total queries for progress tracking
     total_arxiv_queries = sum(len(keywords) for keywords in topics.values())

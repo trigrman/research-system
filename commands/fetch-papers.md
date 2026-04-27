@@ -1,6 +1,6 @@
 ---
 name: fetch-papers
-description: Manually run the paper fetching script to retrieve new papers from arXiv, Semantic Scholar, and Google Scholar. Supports --days-back for historical searches.
+description: Manually run the paper fetching script to retrieve new papers from arXiv, Semantic Scholar, and Google Scholar. Supports --days-back for historical searches and --query for ad hoc searches.
 allowed-tools: [Read, Bash]
 model: haiku
 ---
@@ -17,23 +17,31 @@ Manually trigger paper fetching from arXiv, Semantic Scholar, and Google Scholar
 
 ## Step 2: Parse Arguments
 
-Check if the user provided a number of days as an argument (e.g., `/fetch-papers 90`).
+Three modes are supported:
 
-- If a number is provided, use it as the `--days-back` flag
-- If no argument is provided, run with default config values (daily mode)
+- **Daily mode** — no arguments: `/fetch-papers`
+- **Backfill mode** — a number of days: `/fetch-papers 90` → `--days-back 90`
+- **Ad hoc mode** — one or more `--query` strings, optionally with `--topic-name` and `--days-back`. Bypasses keywords.md. Example: `/fetch-papers --query "picture superiority effect" --query "dual coding theory" --topic-name aiviz-talk --days-back 365`
+
+Pass through any `--query`, `--topic-name`, and `--days-back` flags the user provides directly to the script.
 
 ## Step 3: Run Fetch Script
 
 1. **Run the fetch script:**
 
-   If no days-back argument:
+   Daily mode:
    ```bash
    cd ${CLAUDE_PLUGIN_ROOT}/scripts/automation && python3 fetch_papers.py
    ```
 
-   If days-back argument provided (e.g., user said `/fetch-papers 90`):
+   Backfill mode (e.g., user said `/fetch-papers 90`):
    ```bash
    cd ${CLAUDE_PLUGIN_ROOT}/scripts/automation && python3 fetch_papers.py --days-back 90
+   ```
+
+   Ad hoc mode — pass through `--query` (repeatable), `--topic-name`, and any `--days-back`:
+   ```bash
+   cd ${CLAUDE_PLUGIN_ROOT}/scripts/automation && python3 fetch_papers.py --query "..." --query "..." --topic-name <name> --days-back <N>
    ```
 
 2. **Capture output** - the script will show:
@@ -80,6 +88,7 @@ Results:
 
 - **Daily mode** (no arguments): Searches arXiv and Semantic Scholar with config defaults (1 day, 10 results). Google Scholar only on Sundays.
 - **Backfill mode** (`/fetch-papers 90`): Searches all sources for last N days with max_results bumped to 100. Google Scholar runs regardless of day.
+- **Ad hoc mode** (`--query`): Bypasses keywords.md. Each `--query` becomes one search string under the topic named by `--topic-name` (default `ad-hoc`). Combine with `--days-back N` for historical scope.
 - Semantic Scholar is free (no API key needed), rate limited to ~100 requests per 5 minutes
 - Results are written to `daily-digests/YYYY-MM-DD.md`
 - Duplicate papers (seen before) are automatically filtered out
