@@ -5,6 +5,7 @@ Generates daily digest in markdown format.
 """
 
 import os
+import re
 import sys
 import yaml
 import json
@@ -407,6 +408,127 @@ def save_seen_semantic_scholar_papers(config, seen_urls):
             'last_updated': datetime.now().isoformat()
         }, f, indent=2)
 
+def _s2_paper_dict(paper):
+    """Convert a Semantic Scholar paper record to the digest's paper dict shape."""
+    paper_url = paper.get('url', '')
+    if not paper_url:
+        paper_url = f"https://www.semanticscholar.org/paper/{paper.get('paperId', '')}"
+
+    authors = paper.get('authors', []) or []
+    author_str = ', '.join(a.get('name', 'Unknown') for a in authors[:5])
+    if len(authors) > 5:
+        author_str += f' et al. ({len(authors)} authors)'
+
+    paper_dict = {
+        'title': paper.get('title', 'No title'),
+        'authors': author_str,
+        'year': paper.get('year', 'Unknown'),
+        'abstract': (paper.get('abstract') or '').replace('\n', ' '),
+        'url': paper_url,
+        'source': 'Semantic Scholar',
+        'citations': paper.get('citationCount', 0),
+    }
+
+    open_access = paper.get('openAccessPdf')
+    if open_access and open_access.get('url'):
+        paper_dict['pdf_url'] = open_access['url']
+
+    external_ids = paper.get('externalIds', {})
+    if external_ids and external_ids.get('ArXiv'):
+        paper_dict['arxiv_id'] = external_ids['ArXiv']
+
+    return paper_url, paper_dict
+
+
+def _s2_paper_passes_date_filter(paper, cutoff_date):
+    """Return True if paper's publication date is on/after cutoff_date.
+
+    Falls back to year if publicationDate is missing. If neither is present,
+    the paper is included (matching the existing /paper/search behavior, which
+    relied on server-side filtering and didn't second-guess the result set)."""
+    pub_date_str = paper.get('publicationDate')
+    if pub_date_str:
+        try:
+            return datetime.strptime(pub_date_str, '%Y-%m-%d') >= cutoff_date
+        except ValueError:
+            pass
+    year = paper.get('year')
+    if year:
+        return year >= cutoff_date.year
+    return True
+
+
+def search_semantic_scholar_by_author(author_query, max_results, days_back, api_key,
+                                       seen_urls, previously_seen):
+    """Search Semantic Scholar's /author/search endpoint and return that author's papers.
+
+    The default /paper/search endpoint treats `au:Foo` as full-text and matches
+    any paper containing those tokens, which is useless for author lookups.
+    The /author/search endpoint takes a name and returns matching authors with
+    their papers nested in the response, which is what arXiv's `au:` does.
+    """
+    base_url = "https://api.semanticscholar.org/graph/v1/author/search"
+    fields = ("name,papers.paperId,papers.title,papers.authors,papers.abstract,"
+              "papers.year,papers.url,papers.externalIds,papers.publicationDate,"
+              "papers.citationCount,papers.openAccessPdf")
+
+    params = urllib.parse.urlencode({
+        'query': author_query,
+        'limit': 10,
+        'fields': fields,
+    })
+    url = f"{base_url}?{params}"
+
+    cutoff_date = datetime.now() - timedelta(days=days_back)
+    new_papers = []
+
+    max_retries = 3
+    retry_delays = [5, 15, 30]
+
+    for attempt in range(max_retries + 1):
+        try:
+            req = urllib.request.Request(url)
+            req.add_header('User-Agent', 'ResearchAutomation/1.0')
+            if api_key:
+                req.add_header('x-api-key', api_key)
+
+            with urllib.request.urlopen(req, timeout=30) as response:
+                data = json.loads(response.read().decode())
+
+            for author in data.get('data', []):
+                if len(new_papers) >= max_results:
+                    break
+                for paper in (author.get('papers') or []):
+                    if len(new_papers) >= max_results:
+                        break
+                    if not _s2_paper_passes_date_filter(paper, cutoff_date):
+                        continue
+                    paper_url, paper_dict = _s2_paper_dict(paper)
+                    if paper_url in seen_urls or paper_url in previously_seen:
+                        continue
+                    new_papers.append(paper_dict)
+                    seen_urls.add(paper_url)
+
+            return new_papers
+
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < max_retries:
+                delay = retry_delays[attempt]
+                print(f"    429 rate limited (author search), retrying in {delay}s...", flush=True)
+                time.sleep(delay)
+            elif e.code == 429:
+                print(f"    429 after {max_retries} retries, skipping author search", flush=True)
+                return new_papers
+            else:
+                print(f"    HTTP error {e.code} on author search: {e.reason}", flush=True)
+                return new_papers
+        except Exception as e:
+            print(f"    Error in author search: {e}", flush=True)
+            return new_papers
+
+    return new_papers
+
+
 def search_semantic_scholar(keywords, config, max_results=10, days_back=1, api_key=None):
     """Search Semantic Scholar for papers matching keywords.
 
@@ -443,6 +565,19 @@ def search_semantic_scholar(keywords, config, max_results=10, days_back=1, api_k
         if i > 1:
             time.sleep(2 if api_key else 5)
 
+        # Detect arXiv-style author prefix and route to /author/search.
+        # /paper/search treats `au:Foo` as full-text and matches any paper
+        # containing those tokens, which surfaces noise instead of an author's work.
+        author_match = re.match(r'^(?:au|author):\s*(.+)$', keyword, re.IGNORECASE)
+        if author_match:
+            author_query = author_match.group(1).strip()
+            author_papers = search_semantic_scholar_by_author(
+                author_query, min(max_results, 100), days_back, api_key,
+                seen_urls, previously_seen,
+            )
+            all_papers.extend(author_papers)
+            continue
+
         params = urllib.parse.urlencode({
             'query': keyword,
             'limit': min(max_results, 100),
@@ -469,39 +604,9 @@ def search_semantic_scholar(keywords, config, max_results=10, days_back=1, api_k
                 papers = data.get('data', [])
 
                 for paper in papers:
-                    paper_url = paper.get('url', '')
-                    if not paper_url:
-                        paper_url = f"https://www.semanticscholar.org/paper/{paper.get('paperId', '')}"
-
+                    paper_url, paper_dict = _s2_paper_dict(paper)
                     if paper_url in seen_urls or paper_url in previously_seen:
                         continue
-
-                    # Build author string
-                    authors = paper.get('authors', [])
-                    author_str = ', '.join(a.get('name', 'Unknown') for a in authors[:5])
-                    if len(authors) > 5:
-                        author_str += f' et al. ({len(authors)} authors)'
-
-                    paper_dict = {
-                        'title': paper.get('title', 'No title'),
-                        'authors': author_str,
-                        'year': paper.get('year', 'Unknown'),
-                        'abstract': (paper.get('abstract') or '').replace('\n', ' '),
-                        'url': paper_url,
-                        'source': 'Semantic Scholar',
-                        'citations': paper.get('citationCount', 0),
-                    }
-
-                    # Add PDF link if available
-                    open_access = paper.get('openAccessPdf')
-                    if open_access and open_access.get('url'):
-                        paper_dict['pdf_url'] = open_access['url']
-
-                    # Add arXiv link if available
-                    external_ids = paper.get('externalIds', {})
-                    if external_ids and external_ids.get('ArXiv'):
-                        paper_dict['arxiv_id'] = external_ids['ArXiv']
-
                     all_papers.append(paper_dict)
                     seen_urls.add(paper_url)
 
@@ -608,6 +713,13 @@ def main():
     # Setup logging to capture warnings and errors
     logger = setup_logging(config)
     logger.info("Starting fetch_papers.py")
+
+    # Ad hoc --query searches default to a 10-year lookback. Daily defaults
+    # (days_back=1) assume "what was published since the last cron run" and
+    # almost always return zero for a one-off lookup.
+    if args.query and args.days_back is None:
+        args.days_back = 3650
+        print(f"Ad hoc mode: defaulting to --days-back {args.days_back} (override with --days-back N)", flush=True)
 
     if args.days_back:
         logger.info(f"Using --days-back override: {args.days_back} days")
